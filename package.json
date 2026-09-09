@@ -4,14 +4,14 @@
   "description": "MCP server that drives Google Flow (Veo video / Nano Banana images) through a real browser session, speaking Flow's internal tRPC API first, with a hard credit-cost gate.",
   "type": "module",
   "license": "MIT",
-  "author": "Roshan Arnav",
-  "homepage": "https://github.com/roshanarnav25-sloth/google-flow-mcp#readme",
+  "author": "daniazar",
+  "homepage": "https://github.com/daniazar/google-flow-mcp#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/roshanarnav25-sloth/google-flow-mcp.git"
+    "url": "git+https://github.com/daniazar/google-flow-mcp.git"
   },
   "bugs": {
-    "url": "https://github.com/roshanarnav25-sloth/google-flow-mcp/issues"
+    "url": "https://github.com/daniazar/google-flow-mcp/issues"
   },
   "bin": {
     "google-flow-mcp": "dist/index.js"

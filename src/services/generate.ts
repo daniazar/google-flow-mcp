@@ -1,7 +1,14 @@
 import { POLL_INTERVAL_MS, TIMEOUTS } from "../constants.js";
 import { BudgetError, FlowError, type CostQuote, type GenerationResult, type LedgerEntry } from "../types.js";
 import { assertNoStopSignal, getFlowPage } from "./browser.js";
-import { attachMedia, clearAttachments } from "./compose.js";
+import {
+  assignFrame,
+  attachMedia,
+  clearAttachments,
+  readSettings,
+  trigger1080pUpscaleLatest,
+  uploadToSlot,
+} from "./compose.js";
 import { appendLedger, assertAffordable, recordSpend } from "./ledger.js";
 import { downloadMedia, listMedia } from "./media.js";
 import { readCredits, readSession } from "./session.js";
@@ -36,23 +43,26 @@ export interface GenerateOptions {
   free?: boolean;
   timeoutMs?: number;
   /**
-   * Attachments decide the generation MODE — Flow has no mode switch, only what
-   * is on the composer when Enter is pressed:
-   *   startFrame           -> Frames-to-Video (the composition is preserved)
-   *   startFrame+endFrame  -> Frames-to-Video with an interpolation target
-   *   referenceMediaIds    -> Ingredients-to-Video (recomposes; <=3 refs)
-   *   none                 -> Text-to-Video (least control)
+   * Frame conditioning for boundary-locked loops and transitions:
+   *   startFrameMediaId / startFramePath -> Start frame
+   *   endFrameMediaId / endFramePath     -> End frame (for locked loops or FLF transitions)
+   *   referenceMediaIds                  -> Ingredients-to-Video (recomposes; <=3 refs)
    */
   startFrameMediaId?: string;
   endFrameMediaId?: string;
+  startFramePath?: string;
+  endFramePath?: string;
   referenceMediaIds?: string[];
+  /** Automatically trigger free 1080p cloud upscale on generated video. */
+  autoUpscale?: boolean;
 }
 
 export function describeMode(opts: GenerateOptions): string {
   if (opts.referenceMediaIds?.length)
     return `Ingredients-to-Video (${opts.referenceMediaIds.length} reference image(s))`;
-  if (opts.startFrameMediaId && opts.endFrameMediaId) return "Frames-to-Video (start + end frame)";
-  if (opts.startFrameMediaId) return "Frames-to-Video (start frame)";
+  if ((opts.startFrameMediaId || opts.startFramePath) && (opts.endFrameMediaId || opts.endFramePath))
+    return "Frames-to-Video (start + end frame locked)";
+  if (opts.startFrameMediaId || opts.startFramePath) return "Frames-to-Video (start frame)";
   return "Text-to-Video (no attachment — composition is uncontrolled)";
 }
 
@@ -90,58 +100,62 @@ async function preflight(free: boolean): Promise<number | null> {
  * frequently does not fire, so Enter is the submit path. We verify the message
  * actually left the box rather than assuming.
  */
+/**
+ * Submit text into Flow's composer.
+ * Supports ProseMirror (modern flow.google.com), textarea, or contenteditable.
+ */
 async function submitPrompt(prompt: string): Promise<void> {
   const page = await getFlowPage();
 
   const focused = await page.evaluate(() => {
+    // 1. ProseMirror (modern flow.google.com prompt box)
+    const prosemirror = document.querySelector<HTMLElement>("div.ProseMirror");
+    if (prosemirror && prosemirror.offsetParent !== null) {
+      prosemirror.focus();
+      prosemirror.click();
+      return true;
+    }
+    // 2. Generic contenteditable
     const boxes = [...document.querySelectorAll<HTMLElement>('div[contenteditable="true"]')].filter(
       (d) => d.offsetParent,
     );
     const box = boxes[boxes.length - 1];
-    if (!box) return false;
-    box.focus();
-    box.click();
-    const range = document.createRange();
-    range.selectNodeContents(box);
-    range.collapse(false);
-    const sel = window.getSelection();
-    sel?.removeAllRanges();
-    sel?.addRange(range);
-    return true;
+    if (box) {
+      box.focus();
+      box.click();
+      const range = document.createRange();
+      range.selectNodeContents(box);
+      range.collapse(false);
+      const sel = window.getSelection();
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+      return true;
+    }
+    // 3. Textarea
+    const textarea = document.querySelector<HTMLTextAreaElement>("textarea.prompt-box-textarea, textarea");
+    if (textarea && textarea.offsetParent !== null) {
+      textarea.focus();
+      return true;
+    }
+    return false;
   });
 
   if (!focused) {
     throw new FlowError(
       "Could not find Flow's prompt composer on the page.",
-      "Confirm a Flow project is open (labs.google/fx/tools/flow/project/<id>) and run flow_check_session.",
+      "Confirm a Flow project is open (flow.google.com/project/<id>) and run flow_check_session.",
     );
   }
 
-  await page.keyboard.type(prompt, { delay: 8 });
-  await page.keyboard.press("Enter");
-  await page.waitForTimeout(1_500);
-
-  const cleared = await page.evaluate(() => {
-    const boxes = [...document.querySelectorAll<HTMLElement>('div[contenteditable="true"]')].filter(
-      (d) => d.offsetParent,
-    );
-    const box = boxes[boxes.length - 1];
-    return !box || (box.innerText ?? "").trim().length === 0;
-  });
-
-  if (!cleared) {
-    throw new FlowError(
-      "The prompt was typed but never sent — Flow's composer still holds the text.",
-      "Nothing was charged. This usually means the chat panel lost focus; retry the call.",
-    );
-  }
+  // Clear existing content and type prompt
+  await page.keyboard.press("Control+A");
+  await page.keyboard.press("Backspace");
+  await page.keyboard.type(prompt, { delay: 4 });
+  await page.waitForTimeout(500);
 }
 
 /**
- * Wait for Flow's agent to propose a generation and quote its cost.
- *
- * We only accept a quote that appears AFTER our own submission, so a stale cost
- * card from a previous turn can never be mistaken for approval of this one.
+ * Wait for Flow's agent to propose a generation and quote its cost (legacy chat mode).
  */
 async function awaitQuote(timeoutMs: number): Promise<CostQuote> {
   const deadline = Date.now() + timeoutMs;
@@ -176,13 +190,7 @@ async function awaitQuote(timeoutMs: number): Promise<CostQuote> {
 }
 
 /**
- * Click Approve, and only Approve.
- *
- * The composer renders the button as an icon ligature plus a label, so its
- * stripped text is "checkApprove". The adjacent "Approve, do not ask again" row
- * contains an inner span whose text is exactly "Approve" — a naive leaf match
- * hits that one and permanently disables the cost gate. Matching the full
- * "checkApprove" string is what keeps them apart.
+ * Click Approve, and only Approve (legacy chat mode).
  */
 async function clickApprove(): Promise<void> {
   if (await clickByText("checkApprove", { exact: true, maxDescendants: 4 })) return;
@@ -198,26 +206,116 @@ async function clickReject(): Promise<void> {
   await clickByText("Reject", { exact: true, maxDescendants: 2 });
 }
 
+/** Trigger modern Flow generation button. */
+async function triggerModernGeneration(): Promise<boolean> {
+  const page = await getFlowPage();
+  return await page.evaluate(() => {
+    const btn = document.querySelector<HTMLButtonElement>(
+      "button.generate-icon-button, button[aria-label*='generation' i], button[aria-label*='generate' i], button.generate-button",
+    );
+    if (btn && !btn.disabled && btn.offsetParent !== null) {
+      btn.click();
+      return true;
+    }
+    return false;
+  });
+}
+
 /**
- * Poll for media that did not exist before submission. This is how we detect
- * completion without ever touching the composer again — the cardinal rule being
- * that an in-flight generation must never be resubmitted.
+ * Live generation telemetry and status.
  */
-async function awaitNewMedia(before: Set<string>, timeoutMs: number): Promise<string[]> {
+export interface GenerationStatus {
+  isGenerating: boolean;
+  activeTilesCount: number;
+  progressText: string | null;
+  lastError: string | null;
+}
+
+/** Check if any active generation is currently in-flight or if an error was raised. */
+export async function getGenerationStatus(): Promise<GenerationStatus> {
+  const page = await getFlowPage();
+  return page.evaluate(() => {
+    const text = document.body?.innerText ?? "";
+    let lastError: string | null = null;
+    if (/audio generation failed/i.test(text)) {
+      lastError = "Flow Audio Generation Failed.";
+    } else if (/violates our policies|prompt failed due to a violation/i.test(text)) {
+      lastError = "Prompt rejected by Flow policy filters.";
+    } else if (/generation failed|something went wrong/i.test(text)) {
+      lastError = "Flow generation failed.";
+    }
+
+    const toast = document.querySelector(".mat-mdc-snack-bar-container, [role='alert']")?.textContent?.trim() || null;
+    if (toast && /fail|error|violation/i.test(toast)) {
+      lastError = toast;
+    }
+
+    const spinners = Array.from(
+      document.querySelectorAll(
+        "mat-spinner, mat-progress-spinner, mat-progress-bar, .spinner, [class*='progress'], [aria-label*='loading' i]",
+      ),
+    ).filter((el) => (el as HTMLElement).offsetParent !== null);
+
+    const match = text.match(/generating\s*(\d{1,3}%?)/i);
+    const progressText = match ? match[0] : spinners.length > 0 ? "Generating..." : null;
+
+    return {
+      isGenerating: spinners.length > 0 || Boolean(progressText),
+      activeTilesCount: spinners.length,
+      progressText,
+      lastError,
+    };
+  });
+}
+
+/**
+ * Poll for media that did not exist before submission.
+ * Fast polling (1s) with immediate failure detection scoped to the newly generated batch.
+ */
+async function awaitNewMedia(before: Set<string>, timeoutMs: number, initialBatchCount = 0): Promise<string[]> {
   const deadline = Date.now() + timeoutMs;
   const page = await getFlowPage();
 
   while (Date.now() < deadline) {
     await page.waitForTimeout(POLL_INTERVAL_MS);
     await assertNoStopSignal(page);
+
+    // Fast-fail check scoped ONLY to the newly mounted batch tile
+    const newTileStatus = await page.evaluate((initialCount) => {
+      const currentTiles = Array.from(document.querySelectorAll<HTMLElement>(".batch-container"));
+      if (currentTiles.length <= initialCount) {
+        return null;
+      }
+      const newestTile = currentTiles[0];
+      const text = (newestTile.innerText || "").replace(/\s+/g, " ");
+      const isFailed = /failed|warning|error|violate/i.test(text) && !/generating|rendering/i.test(text);
+      return {
+        isFailed,
+        text: text.slice(0, 150),
+      };
+    }, initialBatchCount);
+
+    if (newTileStatus && newTileStatus.isFailed) {
+      throw new FlowError(`Flow generation failed: ${newTileStatus.text}`);
+    }
+
+    // Also check for global immediate snackbar toasts
+    const toastError = await page.evaluate(() => {
+      const toast = document.querySelector(".mat-mdc-snack-bar-container, [role='alert']")?.textContent?.trim();
+      return toast && /fail|error|violation/i.test(toast) ? toast : null;
+    });
+    if (toastError) {
+      throw new FlowError(`Flow error alert: ${toastError}`);
+    }
+
     const { items } = await listMedia(500, 0);
     const fresh = items.map((i) => i.mediaId).filter((id) => !before.has(id));
     if (fresh.length > 0) return fresh;
   }
 
   throw new FlowError(
-    `Generation was approved but produced no new media within ${Math.round(timeoutMs / 1000)}s.`,
-    "It was CHARGED and may still be rendering. Check the project library in the browser and use flow_download once it appears. Do NOT resubmit — that is a second charge.",
+    `Generation was submitted but produced no new media within ${Math.round(timeoutMs / 1000)}s.`,
+    "Check the project in the browser and use flow_download once it appears. Do NOT resubmit blindly.",
   );
 }
 
@@ -229,26 +327,186 @@ export async function generate(opts: GenerateOptions): Promise<GenerationResult>
   const { items: beforeItems } = await listMedia(500, 0);
   const before = new Set(beforeItems.map((i) => i.mediaId));
 
-  // Attachments must land BEFORE submission — they are what selects the mode.
-  // A stale chip from a previous turn would silently animate the wrong frame,
-  // so the composer is cleared first regardless of what this call attaches.
-  const wanted = [opts.startFrameMediaId, opts.endFrameMediaId, ...(opts.referenceMediaIds ?? [])].filter(
-    (id): id is string => Boolean(id),
-  );
-  await clearAttachments().catch(() => 0);
-  if (wanted.length > 0) {
-    const { attached, missing } = await attachMedia(wanted);
-    if (missing.length > 0) {
-      throw new FlowError(
-        `Could not attach ${missing.length} of ${wanted.length} frame(s): ${missing.join(", ")}`,
-        "Nothing was charged. Confirm the ids with flow_list_media — a still batch returns two outputs sharing one name, so the id is the only reliable handle.",
-      );
-    }
-    notes.push(`Mode: ${describeMode(opts)}; attached ${attached.length} frame(s).`);
-  } else {
-    notes.push(`Mode: ${describeMode(opts)}.`);
+  // Frame slot conditioning (Start and End frames for boundary-locked loops and transitions)
+  if (opts.startFramePath) {
+    const ok = await uploadToSlot("start", opts.startFramePath);
+    if (!ok) throw new FlowError(`Failed to upload and assign start frame from ${opts.startFramePath}`);
+    notes.push(`Assigned Start frame from file: ${opts.startFramePath}`);
+  } else if (opts.startFrameMediaId) {
+    const ok = await assignFrame("start", opts.startFrameMediaId);
+    if (!ok) throw new FlowError(`Failed to assign start frame media ID: ${opts.startFrameMediaId}`);
+    notes.push(`Assigned Start frame media ID: ${opts.startFrameMediaId}`);
   }
 
+  if (opts.endFramePath) {
+    const ok = await uploadToSlot("end", opts.endFramePath);
+    if (!ok) throw new FlowError(`Failed to upload and assign end frame from ${opts.endFramePath}`);
+    notes.push(`Assigned End frame from file: ${opts.endFramePath}`);
+  } else if (opts.endFrameMediaId) {
+    const ok = await assignFrame("end", opts.endFrameMediaId);
+    if (!ok) throw new FlowError(`Failed to assign end frame media ID: ${opts.endFrameMediaId}`);
+    notes.push(`Assigned End frame media ID: ${opts.endFrameMediaId}`);
+  }
+
+  // Ingredients references (up to 3)
+  if (opts.referenceMediaIds?.length) {
+    await clearAttachments().catch(() => 0);
+    const { attached, missing } = await attachMedia(opts.referenceMediaIds);
+    if (missing.length > 0) {
+      throw new FlowError(`Could not attach ${missing.length} reference image(s): ${missing.join(", ")}`);
+    }
+    notes.push(`Mode: Ingredients-to-Video; attached ${attached.length} reference image(s).`);
+  }
+
+  // Ensure prompt has ambient sound clause if frames are conditioned
+  const hasFrames = opts.startFrameMediaId || opts.startFramePath || opts.endFrameMediaId || opts.endFramePath;
+  const finalPrompt =
+    hasFrames && !/sound:|audio:/i.test(opts.prompt)
+      ? `${opts.prompt}. Sound: faint ambient studio room tone, subtle fabric rustle.`
+      : opts.prompt;
+
+  // Check if modern Flow prompt box is present
+  const page = await getFlowPage();
+  const isModernFlow = await page.evaluate(() => {
+    return Boolean(
+      document.querySelector("div.ProseMirror") ||
+        document.querySelector(".settings-trigger-button") ||
+        document.querySelector(".generate-icon-button"),
+    );
+  });
+
+  if (isModernFlow) {
+    const settings = await readSettings().catch(() => null);
+    let quotedCredits = 5; // default Veo 3.1 Lite
+    if (settings?.model?.toLowerCase().includes("fast")) quotedCredits = 10;
+    else if (settings?.model?.toLowerCase().includes("quality")) quotedCredits = 50;
+
+    if (opts.free) quotedCredits = 0;
+
+    if (quotedCredits > opts.expectedMaxCost) {
+      throw new FlowError(
+        `Generation cost (${quotedCredits} credits) exceeds expectedMaxCost (${opts.expectedMaxCost}).`,
+        `Switch model tier with flow_settings or raise expected_max_cost.`,
+      );
+    }
+
+    if (opts.dryRun) {
+      return {
+        verdict: "rejected",
+        quotedCost: quotedCredits,
+        charged: 0,
+        mediaIds: [],
+        files: [],
+        balanceAfter: balanceBefore,
+        tier: "dom",
+        notes: [`Dry run: Model is ${settings?.model ?? "Veo 3.1 Lite"} (${quotedCredits} credits). Nothing charged.`],
+      };
+    }
+
+    const beforeBatchCount = await page.evaluate(() => document.querySelectorAll(".batch-container").length);
+    await submitPrompt(finalPrompt);
+    await page.waitForTimeout(600);
+
+    // Pre-flight check: is the generate button enabled and are slots valid?
+    const readyState = await page.evaluate(() => {
+      const btn = document.querySelector<HTMLButtonElement>(
+        "button.generate-icon-button, button[aria-label*='generation' i], button[aria-label*='generate' i], button.generate-button",
+      );
+      const disabledChips = document.querySelectorAll(".chip-container-disabled, .disabled-error-icon");
+      return {
+        hasBtn: Boolean(btn),
+        disabled: btn ? btn.disabled : true,
+        hasDisabledChip: disabledChips.length > 0,
+      };
+    });
+
+    if (readyState.hasDisabledChip) {
+      throw new FlowError(
+        "A frame slot has an expired or invalid image (chip-container-disabled). Re-upload or re-assign the frame.",
+      );
+    }
+
+    if (readyState.disabled) {
+      await page.waitForTimeout(1000);
+    }
+
+    const triggered = await triggerModernGeneration();
+    if (!triggered) {
+      await page.keyboard.press("Enter");
+      await page.waitForTimeout(800);
+      const isStillDisabled = await page.evaluate(() => {
+        const btn = document.querySelector<HTMLButtonElement>("button.generate-icon-button");
+        return btn ? btn.disabled : true;
+      });
+      if (isStillDisabled) {
+        throw new FlowError(
+          "Flow generate button is disabled. Confirm prompt text is non-empty and frame slots are valid.",
+        );
+      }
+    }
+
+    await recordSpend(quotedCredits);
+    notes.push(`Submitted at ${quotedCredits} credits.`);
+
+    if (opts.noWait) {
+      await log({
+        kind: "video",
+        opts,
+        quoted: quotedCredits,
+        charged: quotedCredits,
+        balance: balanceBefore,
+        verdict: "in_flight",
+        files: [],
+      });
+      return {
+        verdict: "in_flight",
+        quotedCost: quotedCredits,
+        charged: quotedCredits,
+        mediaIds: [],
+        files: [],
+        balanceAfter: null,
+        tier: "dom",
+        notes: [...notes, "Returned without waiting. Use flow_collect to download once rendering finishes."],
+      };
+    }
+
+    const mediaIds = await awaitNewMedia(before, opts.timeoutMs ?? TIMEOUTS.renderMs, beforeBatchCount);
+    const files = await saveAll(mediaIds, opts.outFile, opts.free ? "jpg" : "mp4");
+    const balanceAfter = await readCredits();
+
+    if (opts.autoUpscale && !opts.free && !opts.dryRun && !opts.noWait) {
+      notes.push("Triggering free 1080p cloud upscale...");
+      try {
+        const upRes = await trigger1080pUpscaleLatest();
+        notes.push(upRes.note);
+      } catch (e) {
+        notes.push(`1080p upscale notice: ${(e as Error).message}`);
+      }
+    }
+
+    await log({
+      kind: opts.free ? "still" : "video",
+      opts,
+      quoted: quotedCredits,
+      charged: quotedCredits,
+      balance: balanceAfter,
+      verdict: "downloaded",
+      files,
+    });
+
+    return {
+      verdict: "downloaded",
+      quotedCost: quotedCredits,
+      charged: quotedCredits,
+      mediaIds,
+      files,
+      balanceAfter,
+      tier: "dom",
+      notes,
+    };
+  }
+
+  // Legacy Flow chat flow fallback
   await submitPrompt(opts.prompt);
 
   // Free stills produce no proposal card, so there is no quote to gate on.

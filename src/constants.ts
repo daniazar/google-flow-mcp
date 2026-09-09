@@ -3,20 +3,23 @@
  * a one-file fix rather than a scavenger hunt.
  */
 
-export const FLOW_ORIGIN = "https://labs.google";
-export const FLOW_HOME = `${FLOW_ORIGIN}/fx/tools/flow`;
+export const FLOW_ORIGINS = ["https://flow.google.com", "https://labs.google"];
+export const FLOW_ORIGIN = "https://flow.google.com";
+export const FLOW_HOME = "https://flow.google.com";
 
-/** Frontend tRPC proxy. Flow's browser code never talks to the backend directly. */
-export const TRPC_BASE = `${FLOW_ORIGIN}/fx/api/trpc`;
+/** Frontend tRPC proxy (legacy labs.google) and modern batchexecute endpoints. */
+export const TRPC_BASE = "https://labs.google/fx/api/trpc";
+export const BATCH_EXECUTE_URL = "https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute";
 
-/** NextAuth session endpoint — the cheapest logged-in/logged-out probe there is. */
-export const AUTH_SESSION_URL = `${FLOW_ORIGIN}/fx/api/auth/session`;
+/** NextAuth session endpoint (legacy) — modern Flow uses Google Accounts. */
+export const AUTH_SESSION_URL = "https://labs.google/fx/api/auth/session";
 
 /** Signed CDN that actually serves rendered media. Never carries auth cookies. */
 export const CDN_HOST_PATTERN = /flow-content\.google/;
 
 /** Hosts worth recording during API discovery. */
 export const DISCOVERY_HOST_PATTERNS: RegExp[] = [
+  /flow\.google\.com/,
   /labs\.google\/fx\/api\//,
   /aisandbox-pa\.googleapis\.com/,
   CDN_HOST_PATTERN,
@@ -33,14 +36,18 @@ export const KNOWN_PROCEDURES = {
   concatenate: "runVideoFxConcatenation",
   /** Scenebuilder export poll; response carries base64 `encodedVideo`. */
   concatenateStatus: "CheckConcatenationStatus",
+  /** RPC ID for project asset listing in modern Flow batchexecute. */
+  listAssetsRpc: "Zzl0ze",
+  /** RPC ID for asset media resolution in modern Flow batchexecute. */
+  resolveMediaRpc: "as29s",
 } as const;
 
-/** Credit cost table. Source: support.google.com/flow/answer/16526234 + live observation. */
+/** Credit cost table. Current live observation: Veo 3.1 Lite is 5 credits, Fast is 10, Quality is 50. */
 export const CREDIT_COSTS: Record<string, number> = {
   still: 0,
-  "veo-3.1-lite": 10,
-  "veo-3.1-fast": 20,
-  "veo-3.1-quality": 100,
+  "veo-3.1-lite": 5,
+  "veo-3.1-fast": 10,
+  "veo-3.1-quality": 50,
   "scenebuilder-extend": 40,
   "upscale-1080p": 0,
   "upscale-4k": 50,
@@ -65,7 +72,7 @@ export const TIMEOUTS = {
   exportMs: 300_000,
 };
 
-export const POLL_INTERVAL_MS = 5_000;
+export const POLL_INTERVAL_MS = 1_000;
 
 /**
  * Page text that means "stop and hand back to a human". Matched case-insensitively

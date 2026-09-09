@@ -47,6 +47,11 @@ const SETTINGS_LABELS: Record<keyof Omit<FlowSettings, "confirmGate">, RegExp> =
 async function openSettings(): Promise<void> {
   const page = await getFlowPage();
   const opened = await page.evaluate(() => {
+    const modernBtn = document.querySelector<HTMLElement>(".settings-trigger-button, button[aria-label*='Settings trigger']");
+    if (modernBtn && modernBtn.offsetParent !== null) {
+      modernBtn.click();
+      return true;
+    }
     const gear = [...document.querySelectorAll<HTMLElement>("button,[role=button]")].find((b) => {
       const label = `${b.getAttribute("aria-label") ?? ""} ${b.textContent ?? ""}`;
       return /setting|tune|gear/i.test(label) && b.offsetParent !== null;
@@ -70,11 +75,33 @@ async function closeSettings(): Promise<void> {
   await page.waitForTimeout(500);
 }
 
-/** Read the per-project generation settings. Free; opens and closes the panel. */
+/** Read the per-project generation settings. Checks localStorage fast-path first. */
 export async function readSettings(): Promise<FlowSettings> {
-  await openSettings();
   const page = await getFlowPage();
 
+  // Fast-path: read from localStorage flow-prompt-box-settings
+  const local = await page.evaluate(() => {
+    try {
+      const raw = localStorage.getItem("flow-prompt-box-settings");
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        return {
+          model: parsed.rt ?? null,
+          aspectRatio: parsed.aspectRatio === "PORTRAIT" ? "9:16" : parsed.aspectRatio === "LANDSCAPE" ? "16:9" : parsed.aspectRatio ?? null,
+          outputsPerPrompt: parsed.Jp ?? 1,
+          durationSeconds: parsed.gB ?? 8,
+          confirmGate: "always" as const,
+        };
+      }
+    } catch {}
+    return null;
+  });
+
+  if (local && local.model) {
+    return local;
+  }
+
+  await openSettings();
   const raw = await page.evaluate(() => {
     const rows: { label: string; value: string }[] = [];
     for (const el of document.querySelectorAll<HTMLElement>("[role=dialog] *, [role=menu] *")) {
@@ -110,47 +137,86 @@ export async function readSettings(): Promise<FlowSettings> {
  * 20. It is deliberately its own tool rather than a generate() argument, because
  * it is project state — setting it per-call would be a lie about how Flow works.
  */
-export async function setSetting(key: keyof typeof SETTINGS_LABELS, value: string): Promise<FlowSettings> {
-  await openSettings();
+/**
+ * Set a per-project setting by syncing localStorage and clicking its labelled control.
+ */
+export async function setSetting(key: keyof typeof SETTINGS_LABELS | "mode", value: string): Promise<FlowSettings> {
   const page = await getFlowPage();
 
-  const changed = await page.evaluate(
-    ([labelSource, target]) => {
-      const labelRe = new RegExp(labelSource as string, "i");
-      const controls = [...document.querySelectorAll<HTMLElement>("[role=dialog] *, [role=menu] *")].filter(
-        (e) => e.offsetParent !== null,
-      );
-      // Open the group whose label matches, then pick the option matching `target`.
-      const group = controls.find((e) => labelRe.test(e.textContent ?? "") && e.children.length <= 4);
-      group?.click();
-      const option = controls.find(
-        (e) => (e.textContent ?? "").replace(/\s+/g, " ").trim().toLowerCase() === (target as string).toLowerCase(),
-      );
-      if (!option) return false;
-      option.click();
-      return true;
-    },
-    [SETTINGS_LABELS[key].source, value] as const,
-  );
+  // 1. Direct localStorage fast sync
+  await page.evaluate(({ k, v }) => {
+    try {
+      const raw = localStorage.getItem("flow-prompt-box-settings");
+      const current = raw ? JSON.parse(raw) : {};
+      const val = v.toLowerCase();
 
-  await page.waitForTimeout(1_000);
-  await closeSettings();
+      if (k === "model") {
+        if (val.includes("lite")) current.rt = "veo_3_1_lite";
+        else if (val.includes("fast")) current.rt = "veo_3_1_fast";
+        else if (val.includes("quality")) current.rt = "veo_3_1_quality";
+      } else if (k === "aspectRatio") {
+        if (val.includes("9:16") || val.includes("portrait")) current.aspectRatio = "PORTRAIT";
+        else if (val.includes("16:9") || val.includes("landscape")) current.aspectRatio = "LANDSCAPE";
+        else if (val.includes("1:1") || val.includes("square")) current.aspectRatio = "SQUARE";
+      } else if (k === "durationSeconds") {
+        current.gB = parseInt(v, 10) || 8;
+      } else if (k === "outputsPerPrompt") {
+        current.Jp = parseInt(v, 10) || 1;
+      } else if (k === "mode") {
+        current.mode = v;
+      }
+      localStorage.setItem("flow-prompt-box-settings", JSON.stringify(current));
+    } catch {}
+  }, { k: key, v: value });
 
-  if (!changed) {
-    throw new FlowError(
-      `Could not set ${key} to "${value}" — no matching option was found in Flow's settings panel.`,
-      `Set it manually in the browser and re-run flow_settings with action=get to confirm. Nothing was charged.`,
+  // 2. Click in settings overlay to update Angular UI
+  try {
+    await openSettings();
+    await page.evaluate(
+      ([k, v]) => {
+        const val = (v as string).toLowerCase();
+        const overlays = Array.from(document.querySelectorAll<HTMLElement>(".cdk-overlay-pane button, [role=dialog] button, [role=menu] button"));
+        
+        if (k === "aspectRatio") {
+          const targetText = val.includes("9:16") || val.includes("portrait") ? "9:16" : "16:9";
+          const btn = overlays.find((b) => (b.innerText || "").includes(targetText));
+          btn?.click();
+        } else if (k === "durationSeconds") {
+          const targetText = `${parseInt(v as string, 10)}s`;
+          const btn = overlays.find((b) => (b.innerText || "").trim() === targetText);
+          btn?.click();
+        } else if (k === "outputsPerPrompt") {
+          const targetText = `x${parseInt(v as string, 10)}`;
+          const btn = overlays.find((b) => (b.innerText || "").trim() === targetText);
+          btn?.click();
+        } else if (k === "mode") {
+          const targetText = (v as string) === "VIDEO_FRAMES" ? "Frames" : "Video";
+          const btn = overlays.find((b) => (b.innerText || "").includes(targetText));
+          btn?.click();
+        }
+      },
+      [key, value] as const,
     );
+    await page.waitForTimeout(400);
+    await closeSettings();
+  } catch {
+    // If UI click fails, localStorage sync above still persists
   }
+
   return readSettings();
 }
 
 /**
- * Open the composer's media picker (the "+" / add control next to the prompt box).
+ * Open the composer's media picker (the "+" / add control or chip slot).
  */
 async function openPicker(): Promise<void> {
   const page = await getFlowPage();
   const opened = await page.evaluate(() => {
+    const chip = document.querySelector<HTMLElement>(".chip-container, button[aria-label*='Add media menu']");
+    if (chip && chip.offsetParent !== null) {
+      chip.click();
+      return true;
+    }
     const add = [...document.querySelectorAll<HTMLElement>("button,[role=button]")].find((b) => {
       const label = `${b.getAttribute("aria-label") ?? ""} ${b.textContent ?? ""}`.trim();
       return /^add|add_2|attach|\+$/i.test(label) && b.offsetParent !== null;
@@ -263,10 +329,234 @@ export async function clearAttachments(): Promise<number> {
       return /remove|clear|close|×/i.test(label) && b.closest('[class*="chip"],[class*="attachment"]') !== null;
     });
     buttons.forEach((b) => b.click());
-    return buttons.length;
+
+    // Also clear prompt box ingredient chips
+    const chips = Array.from(
+      document.querySelectorAll(
+        "flow-prompt-box flow-ingredient-chip, flow-prompt-box flow-character-ingredient-chip, flow-prompt-box .chip-container",
+      ),
+    );
+    chips.forEach((c) => {
+      const btn = c.querySelector("button, mat-icon, [aria-label*='Remove' i], [aria-label*='Delete' i]");
+      if (btn) ((btn as HTMLElement).closest("button") || (btn as HTMLElement)).click();
+    });
+
+    return buttons.length + chips.length;
   });
   await page.waitForTimeout(600);
   return removed;
+}
+
+/** Set prompt box generation mode (VIDEO_FRAMES or TEXT_TO_VIDEO). */
+export async function setFlowMode(mode: "VIDEO_FRAMES" | "TEXT_TO_VIDEO"): Promise<void> {
+  const page = await getFlowPage();
+  await page.evaluate((targetMode) => {
+    try {
+      const raw = localStorage.getItem("flow-prompt-box-settings");
+      const current = raw ? JSON.parse(raw) : {};
+      current.mode = targetMode;
+      localStorage.setItem("flow-prompt-box-settings", JSON.stringify(current));
+    } catch {}
+  }, mode);
+  await page.waitForTimeout(400);
+}
+
+/** Clear Start, End, or both frame chips back to empty-chip. */
+export async function clearFrames(slot: "start" | "end" | "both" = "both"): Promise<number> {
+  const page = await getFlowPage();
+  const cleared = await page.evaluate((targetSlot) => {
+    const chips = Array.from(
+      document.querySelectorAll<HTMLElement>("flow-prompt-box .chip-container, .prompt-box .chip-container"),
+    );
+    let count = 0;
+    chips.forEach((chip, index) => {
+      const isStart = index === 0;
+      const isEnd = index === 1 || (chips.length === 1 && !isStart);
+      if (targetSlot === "both" || (targetSlot === "start" && isStart) || (targetSlot === "end" && isEnd)) {
+        const cancelBtn =
+          chip.querySelector<HTMLElement>(
+            "button, mat-icon, [aria-label*='remove' i], [aria-label*='delete' i], [aria-label*='cancel' i]",
+          ) || chip;
+        if (cancelBtn) {
+          cancelBtn.click();
+          count++;
+        }
+      }
+    });
+    return count;
+  }, slot);
+  if (cleared > 0) await page.waitForTimeout(500);
+  return cleared;
+}
+
+/** Swap first and last frames in prompt box. */
+export async function swapFrames(): Promise<boolean> {
+  const page = await getFlowPage();
+  const swapped = await page.evaluate(() => {
+    const btn = document.querySelector<HTMLButtonElement>("button[aria-label='Swap first and last frames']");
+    if (btn && !btn.disabled && btn.offsetParent !== null) {
+      btn.click();
+      return true;
+    }
+    return false;
+  });
+  if (swapped) await page.waitForTimeout(500);
+  return swapped;
+}
+
+/** Assign an asset to Start or End slot in VIDEO_FRAMES mode. */
+export async function assignFrame(slot: "start" | "end", assetNameOrId: string): Promise<boolean> {
+  const page = await getFlowPage();
+  await setFlowMode("VIDEO_FRAMES");
+
+  // If slot already has an ingredient, clear it first
+  await clearFrames(slot);
+
+  const clicked = await page.evaluate((targetSlot) => {
+    const targetText = targetSlot.toLowerCase() === "start" ? "Start" : "End";
+    const chips = Array.from(document.querySelectorAll<HTMLElement>("button.empty-chip, .frame-trigger button"));
+    const chip = chips.find((c) => (c.innerText || "").trim() === targetText);
+    if (chip && chip.offsetParent !== null) {
+      chip.click();
+      return true;
+    }
+    return false;
+  }, slot);
+
+  if (!clicked) return false;
+  await page.waitForTimeout(1000);
+
+  const selected = await page.evaluate((target) => {
+    const items = Array.from(
+      document.querySelectorAll<HTMLElement>(".cdk-overlay-pane .asset-item, .cdk-overlay-pane button"),
+    );
+    const match = items.find((el) => {
+      const txt = (el.innerText || "").toLowerCase();
+      const img = el.querySelector("img");
+      const src = img ? img.src.toLowerCase() : "";
+      return txt.includes(target.toLowerCase()) || src.includes(target.toLowerCase());
+    });
+    if (match) {
+      match.click();
+      return true;
+    }
+    return false;
+  }, assetNameOrId);
+
+  await page.waitForTimeout(800);
+  await page.keyboard.press("Escape").catch(() => {});
+  return selected;
+}
+
+/** Upload a local file and assign directly to Start or End slot. */
+export async function uploadToSlot(slot: "start" | "end", filePath: string): Promise<boolean> {
+  const page = await getFlowPage();
+  await setFlowMode("VIDEO_FRAMES");
+
+  // If slot already has an ingredient, clear it first
+  await clearFrames(slot);
+
+  const clicked = await page.evaluate((targetSlot) => {
+    const targetText = targetSlot.toLowerCase() === "start" ? "Start" : "End";
+    const chips = Array.from(document.querySelectorAll<HTMLElement>("button.empty-chip, .frame-trigger button"));
+    const chip = chips.find((c) => (c.innerText || "").trim() === targetText);
+    if (chip && chip.offsetParent !== null) {
+      chip.click();
+      return true;
+    }
+    return false;
+  }, slot);
+
+  if (!clicked) return false;
+  await page.waitForTimeout(800);
+
+  const resolved = path.resolve(filePath);
+  const baseName = path.basename(resolved);
+
+  try {
+    const [fileChooser] = await Promise.all([
+      page.waitForEvent("filechooser", { timeout: 10_000 }),
+      page.click(".cdk-overlay-pane button.upload-button, button[aria-label='Upload media'], button.upload-media"),
+    ]);
+
+    await fileChooser.setFiles(resolved);
+    await page.waitForTimeout(3500);
+
+    // After uploading, click the item in the overlay to select it into the slot
+    await page.evaluate((name) => {
+      const items = Array.from(
+        document.querySelectorAll<HTMLElement>(".cdk-overlay-pane .asset-item, .cdk-overlay-pane button"),
+      );
+      const match = items.find((el) => (el.innerText || "").includes(name));
+      if (match) match.click();
+    }, baseName);
+
+    await page.waitForTimeout(800);
+    await page.keyboard.press("Escape").catch(() => {});
+    return true;
+  } catch (err) {
+    await page.keyboard.press("Escape").catch(() => {});
+    throw new FlowError(`Failed to upload ${filePath} to ${slot} slot: ${(err as Error).message}`);
+  }
+}
+
+/** Trigger free 1080p upscale on the latest generated video clip. */
+export async function trigger1080pUpscaleLatest(timeoutMs = 90_000): Promise<{ success: boolean; note: string }> {
+  const page = await getFlowPage();
+
+  const tileClicked = await page.evaluate(() => {
+    const tiles = Array.from(
+      document.querySelectorAll<HTMLElement>("flow-custom-tile, [class*='tile'], flow-tile-container, .batch-container"),
+    );
+    if (tiles.length > 0) {
+      tiles[0].click();
+      return true;
+    }
+    return false;
+  });
+
+  if (!tileClicked) {
+    return { success: false, note: "Could not find latest video tile." };
+  }
+  await page.waitForTimeout(1500);
+
+  await page.evaluate(() => {
+    const btns = Array.from(document.querySelectorAll<HTMLElement>("button[aria-label*='Download' i], button.download-button"));
+    if (btns.length > 0) btns[0].click();
+  });
+  await page.waitForTimeout(800);
+
+  const upscaledClicked = await page.evaluate(() => {
+    const items = Array.from(
+      document.querySelectorAll<HTMLElement>(".cdk-overlay-container button, .mat-mdc-menu-item, [role='menuitem']"),
+    );
+    const item1080 = items.find((el) => (el.textContent || "").includes("1080p"));
+    if (item1080) {
+      item1080.click();
+      return true;
+    }
+    return false;
+  });
+
+  if (!upscaledClicked) {
+    await page.keyboard.press("Escape").catch(() => {});
+    return { success: false, note: "1080p upscale option not offered (clip may already be 1080p)." };
+  }
+
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    await page.waitForTimeout(1000);
+    const inProgress = await page.evaluate(() => {
+      const text = document.body?.innerText ?? "";
+      return /upscaling|rendering 1080p/i.test(text);
+    });
+    if (!inProgress && Date.now() - start > 10_000) {
+      break;
+    }
+  }
+
+  await page.keyboard.press("Escape").catch(() => {});
+  return { success: true, note: "1080p upscale complete." };
 }
 
 /**

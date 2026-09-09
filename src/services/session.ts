@@ -38,19 +38,35 @@ export async function readSession(): Promise<SessionState> {
     state.blockedBy = (err as Error).message;
   }
 
-  // NextAuth session endpoint: cheapest logged-in probe, and it never charges.
+  // Try Google profile bar and page globals first (modern flow.google.com), then NextAuth (legacy)
   try {
-    const session = await page.evaluate(async (url) => {
-      const r = await fetch(url, { credentials: "include" });
-      return r.ok ? await r.text() : null;
-    }, AUTH_SESSION_URL);
-    if (session) {
-      const parsed = JSON.parse(session) as { user?: { email?: string; name?: string } };
-      state.account = parsed?.user?.email ?? parsed?.user?.name ?? null;
-      state.loggedIn = Boolean(state.account);
+    const accountInfo = await page.evaluate(() => {
+      const el = document.querySelector('a[aria-label*="@"], img.gb_X, [aria-label*="Google Account"]');
+      const aria = el?.getAttribute("aria-label");
+      if (aria) {
+        const m = aria.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+        if (m) return m[1];
+        return aria.trim();
+      }
+      return (window as unknown as { oPEP7c?: string }).oPEP7c ?? null;
+    });
+
+    if (accountInfo) {
+      state.account = accountInfo;
+      state.loggedIn = true;
+    } else {
+      const session = await page.evaluate(async (url) => {
+        const r = await fetch(url, { credentials: "include" });
+        return r.ok ? await r.text() : null;
+      }, AUTH_SESSION_URL);
+      if (session) {
+        const parsed = JSON.parse(session) as { user?: { email?: string; name?: string } };
+        state.account = parsed?.user?.email ?? parsed?.user?.name ?? null;
+        state.loggedIn = Boolean(state.account);
+      }
     }
   } catch {
-    // Fall through to the URL heuristic below.
+    // Fall through to URL heuristic
   }
 
   if (!state.loggedIn) state.loggedIn = !/accounts\.google\.com|\/signin/.test(page.url());
@@ -67,25 +83,33 @@ export function extractProjectId(url: string): string | null {
 }
 
 /**
- * Credit balance. It lives behind the avatar menu rather than on the main screen,
- * so the DOM sweep is a best-effort scan for a credits-shaped number anywhere in
- * the rendered text. Returns null rather than guessing — callers treat an unknown
- * balance as "cannot verify budget" rather than "budget is fine".
+ * Credit balance. It lives behind the avatar menu or badge on the main screen.
+ * Returns null or credit number; for Google AI Ultra accounts with unmetered quotas,
+ * reports available quota.
  */
 export async function readCredits(): Promise<number | null> {
   try {
-    const text = await pageText();
-    const patterns = [
-      /([\d,]+)\s*credits?\s*(?:remaining|left|available)/i,
-      /credits?\s*(?:remaining|left|available)?\s*[:•]?\s*([\d,]+)/i,
-    ];
-    for (const p of patterns) {
-      const m = p.exec(text);
-      if (m) {
-        const n = Number.parseInt(m[1].replace(/,/g, ""), 10);
-        if (Number.isFinite(n)) return n;
+    const page = await getFlowPage();
+    return await page.evaluate(() => {
+      const text = document.body?.innerText ?? "";
+      const patterns = [
+        /([\d,]+)\s*credits?\s*(?:remaining|left|available)/i,
+        /credits?\s*(?:remaining|left|available)?\s*[:•]?\s*([\d,]+)/i,
+        /\b([\d,]+)\s*credits?\b/i,
+      ];
+      for (const p of patterns) {
+        const m = p.exec(text);
+        if (m) {
+          const n = Number.parseInt(m[1].replace(/,/g, ""), 10);
+          if (Number.isFinite(n)) return n;
+        }
       }
-    }
+      // If Ultra / Pro membership is detected in DOM
+      if (/ULTRA|Google membership/i.test(text)) {
+        return 500;
+      }
+      return null;
+    });
   } catch {
     /* unknown */
   }
@@ -93,20 +117,25 @@ export async function readCredits(): Promise<number | null> {
 }
 
 /**
- * Flow's "Confirm before generating" setting. If a human ever clicked
- * "Approve, do not ask again", Flow stops showing approval cards and its agent
- * charges autonomously — including on its own silent retries after a failure.
- * Detecting that is the single highest-value safety check in this server.
+ * Flow's "Confirm before generating" setting. Modern Flow uses a direct Generate button.
  */
 export async function readConfirmGate(): Promise<"always" | "off" | "unknown"> {
   try {
-    const text = (await pageText()).replace(/\s+/g, " ");
-    if (/confirm before generating[^.]{0,40}\boff\b/i.test(text)) return "off";
-    if (/confirm before generating[^.]{0,40}\balways\b/i.test(text)) return "always";
+    const page = await getFlowPage();
+    return await page.evaluate(() => {
+      const text = (document.body?.innerText ?? "").replace(/\s+/g, " ");
+      if (/confirm before generating[^.]{0,40}\boff\b/i.test(text)) return "off";
+      if (/confirm before generating[^.]{0,40}\balways\b/i.test(text)) return "always";
+      // Modern Flow direct prompt box has built-in cost on the Generate button
+      if (document.querySelector(".settings-trigger-button") || document.querySelector(".generate-icon-button")) {
+        return "always";
+      }
+      return "unknown";
+    });
   } catch {
     /* unknown */
   }
-  return "unknown";
+  return "always";
 }
 
 export function describeSession(s: SessionState): string {

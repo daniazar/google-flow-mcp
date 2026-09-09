@@ -64,16 +64,24 @@ export function browserMode(): "cdp-attach" | "launched" | "none" {
 export async function getFlowPage(): Promise<Page> {
   const ctx = await getContext();
 
-  if (page && !page.isClosed() && page.url().startsWith(FLOW_ORIGIN)) return page;
+  if (page && !page.isClosed() && (page.url().includes("flow.google.com") || page.url().includes("/fx/tools/flow"))) return page;
 
-  const existing = ctx.pages().find((p) => !p.isClosed() && p.url().includes("/fx/tools/flow"));
-  if (existing) {
-    page = existing;
+  // Prioritize an active project editor page
+  const projectPage = ctx.pages().find((p) => !p.isClosed() && (p.url().includes("flow.google.com/project/") || p.url().includes("/project/")));
+  if (projectPage) {
+    page = projectPage;
+    return page;
+  }
+
+  // Next check any page on flow.google.com or labs.google
+  const anyFlow = ctx.pages().find((p) => !p.isClosed() && (p.url().includes("flow.google.com") || p.url().includes("/fx/tools/flow")));
+  if (anyFlow) {
+    page = anyFlow;
     return page;
   }
 
   page = ctx.pages().find((p) => !p.isClosed()) ?? (await ctx.newPage());
-  if (!page.url().includes("/fx/tools/flow")) {
+  if (!page.url().includes("flow.google.com") && !page.url().includes("/fx/tools/flow")) {
     await page.goto(FLOW_HOME, { waitUntil: "domcontentloaded", timeout: 60_000 });
   }
   return page;
@@ -107,10 +115,10 @@ export async function assertNoStopSignal(p?: Page): Promise<void> {
   }
 }
 
-/** Cookies for the labs.google origin, for the Node-side HTTP tier. */
+/** Cookies for flow.google.com and labs.google, for the Node-side HTTP tier. */
 export async function cookieHeader(): Promise<string> {
   const ctx = await getContext();
-  const cookies = await ctx.cookies(FLOW_ORIGIN);
+  const cookies = await ctx.cookies(["https://flow.google.com", "https://labs.google"]);
   return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
 }
 

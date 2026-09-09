@@ -10,10 +10,22 @@ import { config } from "./config.js";
 import { ABSOLUTE_COST_CEILING, CREDIT_COSTS, RETRY_BUDGET_MULTIPLIER } from "./constants.js";
 import { listApps, openApp } from "./services/apps.js";
 import { closeBrowser } from "./services/browser.js";
-import { readSettings, setSetting, uploadMedia, upscale } from "./services/compose.js";
+import {
+  assignFrame,
+  clearAttachments,
+  clearFrames,
+  readSettings,
+  setFlowMode,
+  setSetting,
+  swapFrames,
+  trigger1080pUpscaleLatest,
+  uploadMedia,
+  uploadToSlot,
+  upscale,
+} from "./services/compose.js";
 import { discoverApi, formatReport, verifyHttpTier } from "./services/discovery.js";
-import { collect, generate } from "./services/generate.js";
-import { deleteMedia, downloadMedia, listMedia } from "./services/media.js";
+import { collect, generate, getGenerationStatus } from "./services/generate.js";
+import { deleteMedia, downloadMedia, getLatestMedia, listMedia } from "./services/media.js";
 import { readBudget, readLedger, resetSpend, setCeiling } from "./services/ledger.js";
 import { createProject, listProjects, openProject } from "./services/project.js";
 import { addClipsToScene, createScene, exportScene } from "./services/scene.js";
@@ -271,6 +283,278 @@ server.registerTool(
         mediaIds: result.mediaIds,
         balanceAfter: result.balanceAfter,
       });
+    } catch (err) {
+      return fail(err);
+    }
+  },
+);
+
+server.registerTool(
+  "flow_generate_loop",
+  {
+    title: "Generate boundary-locked motion loop (M1 -> M1)",
+    description:
+      "Generate a mathematically seamless boundary-locked loop video in Veo 3.1. Clamps the exact same frame image to BOTH the Start and End frame slots. Automatically appends ambient room tone to prevent Veo audio synthesis failure, submits at 5 credits, and automatically upscales to 1080p for free if auto_upscale=true.",
+    inputSchema: {
+      prompt: z
+        .string()
+        .min(10)
+        .max(4000)
+        .describe("Kinematic motion prompt describing movement while locked to starting pose"),
+      frame_path: z.string().optional().describe("Local image path to lock as Start and End boundary"),
+      frame_media_id: z.string().optional().describe("Library media ID or name to lock as Start and End boundary"),
+      expected_max_cost: z.number().int().min(1).max(ABSOLUTE_COST_CEILING).default(5).describe("Veo 3.1 Lite is 5 credits"),
+      dry_run: z.boolean().default(false).describe("Quote the price and verify slots/readiness, but do not charge or submit"),
+      auto_upscale: z.boolean().default(true).describe("Automatically trigger free 1080p cloud upscale upon render completion"),
+      out_file: z.string().optional().describe("Output filename under FLOW_OUTPUT_DIR"),
+      timeout_seconds: z.number().int().min(60).max(900).default(480),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  },
+  async ({ prompt, frame_path, frame_media_id, expected_max_cost, dry_run, auto_upscale, out_file, timeout_seconds }) => {
+    try {
+      const result = await generate({
+        prompt,
+        expectedMaxCost: expected_max_cost,
+        dryRun: dry_run,
+        startFramePath: frame_path,
+        endFramePath: frame_path,
+        startFrameMediaId: frame_media_id,
+        endFrameMediaId: frame_media_id,
+        autoUpscale: auto_upscale,
+        outFile: out_file,
+        timeoutMs: timeout_seconds * 1000,
+      });
+      return ok(
+        `Generated boundary-locked loop (${result.charged} credits):\n${result.files.join("\n")}\n\n${result.notes.join("\n")}`,
+        { ...result },
+      );
+    } catch (err) {
+      return fail(err);
+    }
+  },
+);
+
+server.registerTool(
+  "flow_generate_transition",
+  {
+    title: "Generate First-Last Frame kinematic transition (M1 -> M2)",
+    description:
+      "Generate a kinematic transition between two distinct poses in Veo 3.1. Slots start_frame into Start chip and end_frame into End chip. Automatically appends ambient room tone to prevent Veo audio errors, executes at 5 credits, and upscales to 1080p if auto_upscale=true.",
+    inputSchema: {
+      prompt: z
+        .string()
+        .min(10)
+        .max(4000)
+        .describe("Kinematic transition prompt describing motion trajectory from Start to End pose"),
+      start_frame_path: z.string().optional().describe("Local image path for Start pose"),
+      start_frame_media_id: z.string().optional().describe("Library media ID for Start pose"),
+      end_frame_path: z.string().optional().describe("Local image path for End pose"),
+      end_frame_media_id: z.string().optional().describe("Library media ID for End pose"),
+      expected_max_cost: z.number().int().min(1).max(ABSOLUTE_COST_CEILING).default(5),
+      dry_run: z.boolean().default(false).describe("Quote the price and verify slots/readiness, but do not charge or submit"),
+      auto_upscale: z.boolean().default(true).describe("Automatically trigger free 1080p cloud upscale"),
+      out_file: z.string().optional().describe("Output filename under FLOW_OUTPUT_DIR"),
+      timeout_seconds: z.number().int().min(60).max(900).default(480),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  },
+  async ({
+    prompt,
+    start_frame_path,
+    start_frame_media_id,
+    end_frame_path,
+    end_frame_media_id,
+    expected_max_cost,
+    dry_run,
+    auto_upscale,
+    out_file,
+    timeout_seconds,
+  }) => {
+    try {
+      const result = await generate({
+        prompt,
+        expectedMaxCost: expected_max_cost,
+        dryRun: dry_run,
+        startFramePath: start_frame_path,
+        startFrameMediaId: start_frame_media_id,
+        endFramePath: end_frame_path,
+        endFrameMediaId: end_frame_media_id,
+        autoUpscale: auto_upscale,
+        outFile: out_file,
+        timeoutMs: timeout_seconds * 1000,
+      });
+      return ok(
+        `Generated transition (${result.charged} credits):\n${result.files.join("\n")}\n\n${result.notes.join("\n")}`,
+        { ...result },
+      );
+    } catch (err) {
+      return fail(err);
+    }
+  },
+);
+
+server.registerTool(
+  "flow_set_mode",
+  {
+    title: "Set Flow generation mode",
+    description: "Toggle prompt box mode between VIDEO_FRAMES (Start/End frame chips) and TEXT_TO_VIDEO.",
+    inputSchema: {
+      mode: z.enum(["VIDEO_FRAMES", "TEXT_TO_VIDEO"]).describe("Target prompt box mode"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  async ({ mode }) => {
+    try {
+      await setFlowMode(mode);
+      return ok(`Set Flow prompt box mode to ${mode}.`);
+    } catch (err) {
+      return fail(err);
+    }
+  },
+);
+
+server.registerTool(
+  "flow_upload_frame",
+  {
+    title: "Upload local image to frame slot",
+    description: "Upload a local image file directly to the Start or End frame slot in Google Flow.",
+    inputSchema: {
+      slot: z.enum(["start", "end"]).describe("Target frame slot"),
+      file_path: z.string().describe("Local path to the image file"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  },
+  async ({ slot, file_path }) => {
+    try {
+      const success = await uploadToSlot(slot, file_path);
+      return ok(success ? `Successfully uploaded ${file_path} to ${slot} slot.` : `Failed to upload to ${slot} slot.`);
+    } catch (err) {
+      return fail(err);
+    }
+  },
+);
+
+server.registerTool(
+  "flow_assign_frame",
+  {
+    title: "Assign library asset to frame slot",
+    description: "Assign an existing asset from the project library to the Start or End frame slot by name or media ID.",
+    inputSchema: {
+      slot: z.enum(["start", "end"]).describe("Target frame slot"),
+      asset_name_or_id: z.string().describe("Name or media ID of the asset in the project library"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  },
+  async ({ slot, asset_name_or_id }) => {
+    try {
+      const success = await assignFrame(slot, asset_name_or_id);
+      return ok(
+        success
+          ? `Successfully assigned ${asset_name_or_id} to ${slot} slot.`
+          : `Asset ${asset_name_or_id} not found in library.`,
+      );
+    } catch (err) {
+      return fail(err);
+    }
+  },
+);
+
+server.registerTool(
+  "flow_swap_frames",
+  {
+    title: "Swap first and last frames",
+    description: "Swap the Start and End frames in the Flow prompt box.",
+    inputSchema: {},
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  },
+  async () => {
+    try {
+      const swapped = await swapFrames();
+      return ok(swapped ? "Swapped first and last frames." : "Could not find swap button.");
+    } catch (err) {
+      return fail(err);
+    }
+  },
+);
+
+server.registerTool(
+  "flow_clear_frames",
+  {
+    title: "Clear frame slots",
+    description: "Clear Start, End, or both frame slots in the Flow prompt box.",
+    inputSchema: {
+      slot: z.enum(["start", "end", "both"]).default("both").describe("Which slot to clear"),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  async ({ slot }) => {
+    try {
+      const count = await clearFrames(slot);
+      return ok(`Cleared ${count} frame chip(s).`);
+    } catch (err) {
+      return fail(err);
+    }
+  },
+);
+
+server.registerTool(
+  "flow_get_generation_status",
+  {
+    title: "Get live generation status",
+    description:
+      "Check if generations are actively running in Flow, view progress percentage, or inspect any immediate error alerts.",
+    inputSchema: {},
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  async () => {
+    try {
+      const status = await getGenerationStatus();
+      return ok(JSON.stringify(status, null, 2), status as any);
+    } catch (err) {
+      return fail(err);
+    }
+  },
+);
+
+server.registerTool(
+  "flow_get_latest_video",
+  {
+    title: "Get latest project video",
+    description:
+      "Fetch metadata, media ID, signed CDN URL, and thumbnail for the most recent video in the active Flow project.",
+    inputSchema: {},
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  async () => {
+    try {
+      const item = await getLatestMedia("video");
+      if (!item) return ok("No videos found in the current project library.");
+      return ok(
+        `Latest video: ${item.mediaId}\nName: ${item.name ?? "unnamed"}\nCDN URL: ${item.thumbnailUrl}`,
+        item as any,
+      );
+    } catch (err) {
+      return fail(err);
+    }
+  },
+);
+
+server.registerTool(
+  "flow_upscale_latest",
+  {
+    title: "Upscale latest project video to 1080p",
+    description:
+      "Trigger Google Flow's free cloud 1080p upscale on the newest video in the active project and download the result.",
+    inputSchema: {
+      timeout_seconds: z.number().int().min(30).max(300).default(90),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  },
+  async ({ timeout_seconds }) => {
+    try {
+      const result = await trigger1080pUpscaleLatest(timeout_seconds * 1000);
+      return ok(result.note, result);
     } catch (err) {
       return fail(err);
     }

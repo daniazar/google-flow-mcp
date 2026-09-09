@@ -12,24 +12,55 @@ import { callTrpc } from "./transport.js";
  * reliable path is always: media id -> signed CDN url -> fetch bytes ourselves.
  */
 
-/** Enumerate the project library from the grid DOM. No endpoint is confirmed for this yet. */
+/** Enumerate the project library from modern Flow batch containers and media elements. */
 export async function listMedia(limit = 50, offset = 0): Promise<{ items: MediaItem[]; total: number }> {
   const page = await getFlowPage();
   const all = await page.evaluate(() => {
     const seen = new Map<string, { mediaId: string; kind: string; name: string | null; thumbnailUrl: string | null }>();
-    for (const img of document.querySelectorAll<HTMLImageElement>("img")) {
-      const m = /getMediaUrlRedirect\?name=([^&"']+)/.exec(img.src);
-      if (!m) continue;
-      const id = decodeURIComponent(m[1]);
-      if (seen.has(id)) continue;
-      const card = img.closest("[data-media-id],[role=listitem],li,article") as HTMLElement | null;
-      seen.set(id, {
-        mediaId: id,
-        kind: /video/i.test(id) ? "video" : "image",
-        name: card?.getAttribute("aria-label") ?? img.alt ?? null,
-        thumbnailUrl: img.src,
-      });
+
+    // 1. Scan modern batch containers
+    for (const batch of document.querySelectorAll(".batch-container")) {
+      const prompt = batch.querySelector(".prompt-text")?.textContent?.trim() || null;
+      for (const img of batch.querySelectorAll("img")) {
+        const src = img.src;
+        if (!src) continue;
+        const idMatch =
+          src.match(/flow-content\.google\/(?:image|video)\/([a-zA-Z0-9_-]+)/) ||
+          src.match(/getMediaUrlRedirect\?name=([^&"']+)/) ||
+          src.match(/\/asb\/([a-zA-Z0-9_-]+)/);
+        const id = idMatch ? decodeURIComponent(idMatch[1]) : src.slice(-24);
+        if (!seen.has(id)) {
+          seen.set(id, {
+            mediaId: id,
+            kind: src.includes("/video/") ? "video" : "image",
+            name: prompt ? prompt.slice(0, 60) : img.alt || null,
+            thumbnailUrl: src,
+          });
+        }
+      }
     }
+
+    // 2. Scan all other images and videos on page
+    for (const el of document.querySelectorAll<HTMLImageElement | HTMLVideoElement>("img, video")) {
+      const src = (el as HTMLImageElement).src || (el as HTMLVideoElement).currentSrc || el.getAttribute("src");
+      if (!src) continue;
+      if (src.includes("flow-content.google") || src.includes("getMediaUrlRedirect") || src.includes("/asb/")) {
+        const idMatch =
+          src.match(/flow-content\.google\/(?:image|video)\/([a-zA-Z0-9_-]+)/) ||
+          src.match(/getMediaUrlRedirect\?name=([^&"']+)/) ||
+          src.match(/\/asb\/([a-zA-Z0-9_-]+)/);
+        const id = idMatch ? decodeURIComponent(idMatch[1]) : src.slice(-24);
+        if (!seen.has(id)) {
+          seen.set(id, {
+            mediaId: id,
+            kind: el.tagName === "VIDEO" || src.includes("/video/") ? "video" : "image",
+            name: (el as HTMLImageElement).alt || null,
+            thumbnailUrl: src,
+          });
+        }
+      }
+    }
+
     return [...seen.values()];
   });
 
@@ -37,24 +68,76 @@ export async function listMedia(limit = 50, offset = 0): Promise<{ items: MediaI
   return { items, total: all.length };
 }
 
-/** Resolve a media id to its signed, time-limited CDN url. */
-export async function resolveMediaUrl(mediaId: string): Promise<string> {
-  const res = await callTrpc({
-    procedure: KNOWN_PROCEDURES.mediaUrlRedirect,
-    method: "GET",
-    rawQuery: { name: mediaId },
-  });
+/** Resolve a media id to its signed CDN url. */
+export async function resolveMediaUrl(mediaId: string, kind?: "video" | "image"): Promise<string> {
+  const page = await getFlowPage();
 
-  // The endpoint 302s; fetch follows it, so the final url is what we want.
-  if (res.finalUrl && !res.finalUrl.includes("getMediaUrlRedirect")) return res.finalUrl;
+  // 1. If looking for a video, check video elements or click batch tile to mount video player
+  if (kind !== "image") {
+    const existingVideo = await page.evaluate((id) => {
+      for (const v of document.querySelectorAll<HTMLVideoElement>("video")) {
+        const src = v.src || v.currentSrc;
+        if (src && src.includes(id)) return src;
+      }
+      return null;
+    }, mediaId);
 
-  const fromBody = typeof res.data === "string" ? res.data : (res.data as { url?: string })?.url;
-  if (fromBody && /^https?:\/\//.test(fromBody)) return fromBody;
+    if (existingVideo && existingVideo.startsWith("http")) return existingVideo;
+
+    // Click matching batch tile or play button to mount video element
+    await page.evaluate((id) => {
+      const img = [...document.querySelectorAll<HTMLImageElement>("img")].find(
+        (i) => i.src.includes(id) || i.src.includes(encodeURIComponent(id)),
+      );
+      const batch = img?.closest(".batch-container, flow-custom-tile, [class*='tile']");
+      if (batch) {
+        const playBtn =
+          batch.querySelector<HTMLElement>("button, [aria-label*='Play' i], img") || (batch as HTMLElement);
+        if (playBtn && playBtn.click) playBtn.click();
+      }
+    }, mediaId);
+
+    await page.waitForTimeout(2000);
+
+    const mountedVideo = await page.evaluate((id) => {
+      for (const v of document.querySelectorAll<HTMLVideoElement>("video")) {
+        const src = v.src || v.currentSrc;
+        if (src && (src.includes(id) || src.includes("/video/"))) return src;
+      }
+      return null;
+    }, mediaId);
+
+    if (mountedVideo && mountedVideo.startsWith("http")) return mountedVideo;
+  }
+
+  // 2. Direct lookup for image or any element
+  const domUrl = await page.evaluate((id) => {
+    for (const el of document.querySelectorAll<HTMLImageElement | HTMLVideoElement>("video, img, a")) {
+      const src = (el as HTMLImageElement).src || (el as HTMLVideoElement).currentSrc || el.getAttribute("href");
+      if (src && src.includes(id)) return src;
+    }
+    return null;
+  }, mediaId);
+
+  if (domUrl && domUrl.startsWith("http")) return domUrl;
+
+  // 3. Direct CDN url pattern fallback
+  if (/^[a-f0-9-]{36}$/i.test(mediaId)) {
+    return `https://flow-content.google/${kind === "image" ? "image" : "video"}/${mediaId}`;
+  }
 
   throw new FlowError(
     `Could not resolve a CDN url for media ${mediaId}.`,
-    `Run flow_check_session — an idle tab's API session expires and this endpoint then returns "No session found".`,
+    `Run flow_check_session to ensure the active Flow tab is open.`,
   );
+}
+
+/** Retrieve the latest media item from the active project. */
+export async function getLatestMedia(kind?: "video" | "image"): Promise<MediaItem | null> {
+  const { items } = await listMedia(20, 0);
+  if (items.length === 0) return null;
+  if (!kind) return items[0];
+  return items.find((i) => i.kind === kind) ?? null;
 }
 
 /**
@@ -66,15 +149,20 @@ export async function downloadMedia(
   mediaId: string,
   outFile: string,
 ): Promise<{ file: string; bytes: number; kind: string }> {
-  const target = path.isAbsolute(outFile) ? outFile : path.join(config.outputDir, outFile);
-  await fs.mkdir(path.dirname(target), { recursive: true });
+  let resolvedPath = path.isAbsolute(outFile) ? outFile : path.join(config.outputDir, outFile);
+  const isVideo = resolvedPath.toLowerCase().endsWith(".mp4") || !resolvedPath.includes(".");
+  if (resolvedPath.endsWith("/") || resolvedPath.endsWith("\\")) {
+    resolvedPath = path.join(resolvedPath, `flow-${mediaId.slice(-12)}.${isVideo ? "mp4" : "jpg"}`);
+  }
+  await fs.mkdir(path.dirname(resolvedPath), { recursive: true });
 
-  let buffer = await fetchSigned(mediaId);
+  const targetKind = isVideo ? "video" : "image";
+  let buffer = await fetchSigned(mediaId, targetKind);
 
   // A stale session yields a JSON/text body where media bytes belong. One reload fixes it.
   if (!identify(buffer)) {
     await reloadSession();
-    buffer = await fetchSigned(mediaId);
+    buffer = await fetchSigned(mediaId, targetKind);
   }
 
   const kind = identify(buffer);
@@ -92,12 +180,12 @@ export async function downloadMedia(
     );
   }
 
-  await fs.writeFile(target, buffer);
-  return { file: target, bytes: buffer.length, kind };
+  await fs.writeFile(resolvedPath, buffer);
+  return { file: resolvedPath, bytes: buffer.length, kind };
 }
 
-async function fetchSigned(mediaId: string): Promise<Buffer> {
-  const url = await resolveMediaUrl(mediaId);
+async function fetchSigned(mediaId: string, kind?: "video" | "image"): Promise<Buffer> {
+  const url = await resolveMediaUrl(mediaId, kind);
   const res = await fetch(url, { redirect: "follow" });
   return Buffer.from(await res.arrayBuffer());
 }

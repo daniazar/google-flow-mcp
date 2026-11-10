@@ -19,16 +19,27 @@ export async function getContext(): Promise<BrowserContext> {
   if (context && isAlive()) return context;
 
   if (config.cdpUrl) {
+    const cdpTimeout = Number(process.env.FLOW_CDP_TIMEOUT_MS) || 30_000;
     try {
-      browser = await chromium.connectOverCDP(config.cdpUrl, { timeout: 10_000 });
-    } catch (err) {
-      throw new FlowError(
-        `Could not attach to Chrome at ${config.cdpUrl}: ${(err as Error).message}`,
-        `Start Chrome with remote debugging, then retry:\n` +
-          `  /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.google-flow-mcp/chrome-profile"\n` +
-          `Log into labs.google/fx/tools/flow in that window first. ` +
-          `Or unset FLOW_CDP_URL to let this server launch its own browser.`,
-      );
+      browser = await chromium.connectOverCDP(config.cdpUrl, { timeout: cdpTimeout });
+    } catch (firstErr) {
+      // Retry once after waking up the browser's event loop
+      try {
+        await new Promise((r) => setTimeout(r, 1000));
+        browser = await chromium.connectOverCDP(config.cdpUrl, { timeout: cdpTimeout });
+      } catch (err) {
+        const isWin = process.platform === 'win32';
+        const winCmd = `cmd /c start msedge --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1 --disable-background-timer-throttling --disable-backgrounding-occluded-windows --user-data-dir="%TEMP%\\flow-edge" https://flow.google.com/`;
+        const macCmd = `/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.google-flow-mcp/chrome-profile"`;
+        throw new FlowError(
+          `Could not attach to Chrome at ${config.cdpUrl}: ${(err as Error).message}`,
+          `Ensure the browser window is open and NOT minimized/suspended, and close any open DevTools (F12) tabs.\n\n` +
+            `To launch with remote debugging, run:\n` +
+            (isWin ? `  ${winCmd}\n` : `  ${macCmd}\n`) +
+            `Then log into flow.google.com in that window, keep the Flow tab in the foreground, and retry.\n` +
+            `Or unset FLOW_CDP_URL to let this server launch its own browser.`,
+        );
+      }
     }
     const contexts = browser.contexts();
     context = contexts.length > 0 ? contexts[0] : await browser.newContext();

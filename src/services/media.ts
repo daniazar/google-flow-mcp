@@ -159,10 +159,13 @@ export async function downloadMedia(
   const targetKind = isVideo ? "video" : "image";
   let buffer = await fetchSigned(mediaId, targetKind);
 
-  // A stale session yields a JSON/text body where media bytes belong. One reload fixes it.
+  // A stale session yields a JSON/text body where media bytes belong. Only reload if an actual session error was returned.
   if (!identify(buffer)) {
-    await reloadSession();
-    buffer = await fetchSigned(mediaId, targetKind);
+    const preview = buffer.subarray(0, 500).toString("utf8");
+    if (/no session found|unauthorized|"code":\s*401/i.test(preview)) {
+      await reloadSession();
+      buffer = await fetchSigned(mediaId, targetKind);
+    }
   }
 
   const kind = identify(buffer);
